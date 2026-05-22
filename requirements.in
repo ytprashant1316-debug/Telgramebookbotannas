@@ -1,2 +1,4 @@
-selenium>=4.8.2
-webdriver_manager>=3.8.2
+cloudscraper
+beautifulsoup4
+python-telegram-bot[all]
+pymongo[srv]

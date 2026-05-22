@@ -1,3 +1,16 @@
 {
-    "download_path":""
+  "download_path": "",
+  "base_url": "https://annas-archive.gl",
+  "libgen_base_url": "http://libgen.vg",
+  "owner_ids": [5450311131, 915392007],
+  "service_enabled": true,
+  "read_button": true,
+  "search_mode": "all",
+  "delivery_mode": "group",
+  "connected_group_id": null,
+  "welcome": {
+    "text": "",
+    "photo_file_id": null
+  },
+  "per_chat": {}
 }
