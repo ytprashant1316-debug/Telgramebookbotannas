@@ -42,10 +42,10 @@ from bs4 import BeautifulSoup
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-BOT_TOKEN = "8560074195:AAHSNsVaRJu2194--dPh7D06AmqAWcNt_jQ"
+BOT_TOKEN = "8994067851:AAGVoAaaKTPhOY4EZn4gRm1tuOJ5yHU7YNo"
 
 # MongoDB Connection Setup
-MONGO_URI = "mongodb+srv://soniprashant671_db_user:sC0oFGksHNHf8kIz@cluster0.j5hwlec.mongodb.net/?appName=Cluster0"
+MONGO_URI = "mongodb+srv://soniprashant671_db_user:ritik1103@cluster0.j5hwlec.mongodb.net/?appName=Cluster0"
 mongo_client = None
 settings_col = None
 users_col = None
@@ -723,7 +723,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not welcome_text:
         welcome_text = (
-            "📚 *Anna's Archive Bot*\n\n"
+            "📚 *Prashant's Pages Bot*\n\n"
             "Send me a book title or author name to search\\.\n"
             "Example: `Harry Potter`\n\n"
             "Use /help to see all available commands\\."
@@ -778,7 +778,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     }.get(search_mode, search_mode)
 
     text = (
-        "📚 *Anna's Archive Bot — Help*\n\n"
+        "📚 *Prashant's Pages Bot — Help*\n\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
         "*🔍 Search*\n"
         "• `/search <query>` — slash command search\n"
