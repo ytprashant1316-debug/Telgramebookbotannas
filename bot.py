@@ -45,7 +45,7 @@ from bs4 import BeautifulSoup
 BOT_TOKEN = "8560074195:AAHSNsVaRJu2194--dPh7D06AmqAWcNt_jQ"
 
 # MongoDB Connection Setup
-MONGO_URI = "mongodb+srv://soniprashant671_db_user:sC0oFGksHNHf8kIz@cluster0.j5hwlec.mongodb.net/?appName=Cluster0"
+MONGO_URI = "mongodb+srv://soniprashant671_db_user:ritik1103@cluster0.j5hwlec.mongodb.net/?appName=Cluster0"
 mongo_client = None
 settings_col = None
 users_col = None
