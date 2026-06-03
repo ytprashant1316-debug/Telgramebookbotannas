@@ -158,6 +158,7 @@ def _init_cfg():
         "delivery_mode": "group",
         "read_button": True,
         "welcome": {},
+        "welcome_enabled": True,
         "auto_delete": False,
         "delete_time": 120,
         "dump_channel": None,
@@ -445,10 +446,60 @@ def get_active_libgen_domain() -> str:
     return LIBGEN_FALLBACK_DOMAINS[0]
 
 
-BASE_URL = get_active_domain()
-LIBGEN_BASE = get_active_libgen_domain()
-print(f"[domain] {BASE_URL}")
-print(f"[libgen] {LIBGEN_BASE}")
+# ---------------------------------------------------------------------------
+# Dynamic domain manager – auto-heals when a domain goes down
+# ---------------------------------------------------------------------------
+import threading
+
+class _DomainManager:
+    """Thread-safe, self-healing domain cache.
+
+    On first access the domain is resolved exactly like the old startup code.
+    When a caller reports a failure via `invalidate()`, the cached value is
+    cleared so the *next* access triggers rediscovery – no restart needed.
+    """
+
+    def __init__(self, discover_fn, fallbacks, label):
+        self._discover_fn = discover_fn
+        self._fallbacks = fallbacks
+        self._label = label
+        self._lock = threading.Lock()
+        self._value = None
+
+    @property
+    def url(self) -> str:
+        if self._value is not None:
+            return self._value
+        with self._lock:
+            if self._value is None:  # double-check after acquiring lock
+                self._value = self._discover_fn()
+                print(f"[{self._label}] resolved → {self._value}")
+        return self._value
+
+    def invalidate(self, bad_url: str | None = None):
+        """Mark the current domain as dead so the next `.url` rediscovers."""
+        with self._lock:
+            if bad_url is None or self._value == bad_url:
+                print(f"[{self._label}] invalidated {self._value!r}, will rediscover")
+                self._value = None
+                # Also clear the cached value in config so rediscovery is forced
+                cfg = _load_cfg()
+                cfg_key = "base_url" if "domain" in self._label else "libgen_base_url"
+                if cfg.get(cfg_key):
+                    cfg[cfg_key] = ""
+                    _save_cfg(cfg)
+
+    @property
+    def fallbacks(self) -> list:
+        return list(self._fallbacks)
+
+
+_domain_mgr = _DomainManager(get_active_domain, FALLBACK_DOMAINS, "domain")
+_libgen_mgr = _DomainManager(get_active_libgen_domain, LIBGEN_FALLBACK_DOMAINS, "libgen")
+
+# Warm the caches eagerly (same behaviour as the old code)
+print(f"[domain] {_domain_mgr.url}")
+print(f"[libgen] {_libgen_mgr.url}")
 
 # ---------------------------------------------------------------------------
 # UI helpers
@@ -531,25 +582,65 @@ def _is_chat_allowed(update: Update, allow_connect: bool = False) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Reusable cloudscraper session (prevents "Too many open files")
+# ---------------------------------------------------------------------------
+_scraper_lock = threading.Lock()
+_scraper_instance = None
+
+def _get_scraper():
+    """Return a shared cloudscraper session, creating it on first use."""
+    global _scraper_instance
+    if _scraper_instance is None:
+        with _scraper_lock:
+            if _scraper_instance is None:
+                _scraper_instance = cloudscraper.create_scraper()
+    return _scraper_instance
+
+
+# ---------------------------------------------------------------------------
 # Sync worker: search
 # ---------------------------------------------------------------------------
 
 def _sync_search(query: str, count: int = 10) -> list:
-    scraper = cloudscraper.create_scraper()
+    scraper = _get_scraper()
     from urllib.parse import quote_plus
     quoted_query = quote_plus(query)
-    url = f"{BASE_URL}/search?index=&page=1&sort=&src=lgli&display=&q={quoted_query}"
-    resp = scraper.get(url, timeout=15)
-    if resp.status_code != 200:
-        for backup_domain in FALLBACK_DOMAINS:
-            if backup_domain != BASE_URL:
-                try:
-                    url = f"{backup_domain}/search?index=&page=1&sort=&src=lgli&display=&q={quoted_query}"
-                    resp = scraper.get(url, timeout=10)
-                    if resp.status_code == 200:
-                        break
-                except Exception:
-                    pass
+
+    # Build ordered list: current cached domain first, then all fallbacks
+    primary = _domain_mgr.url
+    domains_to_try = [primary] + [
+        d for d in _domain_mgr.fallbacks if d != primary
+    ]
+
+    resp = None
+    working_domain = primary  # track which domain actually worked
+
+    for domain in domains_to_try:
+        try:
+            url = f"{domain}/search?index=&page=1&sort=&src=lgli&display=&q={quoted_query}"
+            resp = scraper.get(url, timeout=15)
+            if resp.status_code == 200:
+                working_domain = domain
+                break
+        except Exception as exc:
+            logging.warning(f"[search] {domain} failed: {exc}")
+            # If the primary domain timed-out, invalidate so next search
+            # rediscovers automatically instead of hitting the same dead host.
+            if domain == primary:
+                _domain_mgr.invalidate(domain)
+            resp = None
+            continue
+
+    if resp is None or resp.status_code != 200:
+        raise ConnectionError("All Anna's Archive domains are unreachable")
+
+    # If a fallback domain succeeded, promote it as the new cached primary
+    if working_domain != primary:
+        cfg = _load_cfg()
+        cfg["base_url"] = working_domain
+        _save_cfg(cfg)
+        _domain_mgr.invalidate()  # force reload from config next time
+        logging.info(f"[search] Switched primary domain → {working_domain}")
 
     soup = BeautifulSoup(resp.text, "html.parser")
     links = soup.find_all("a", class_=["js-vim-focus", "custom-a"])
@@ -563,7 +654,7 @@ def _sync_search(query: str, count: int = 10) -> list:
         try:
             href = lnk.get("href") or ""
             if href and not href.startswith("http"):
-                href = urljoin(BASE_URL, href)
+                href = urljoin(working_domain, href)
             title = lnk.get_text().strip()
 
             container = lnk
@@ -634,19 +725,46 @@ def _sync_get_direct_url(book_url: str) -> str:
         raise ValueError("Could not extract MD5 from book URL")
     md5 = md5_m.group(1)
 
-    ads_url = f"{LIBGEN_BASE}/ads.php?md5={md5}"
-    req = urllib.request.Request(
-        ads_url, headers={"User-Agent": "Mozilla/5.0 (compatible; annadl/1.0)"}
-    )
-    with urllib.request.urlopen(req, timeout=15) as resp:
-        html = resp.read().decode("utf-8", errors="replace")
+    # Build ordered list: current cached libgen domain first, then fallbacks
+    primary = _libgen_mgr.url
+    domains_to_try = [primary] + [
+        d for d in _libgen_mgr.fallbacks if d != primary
+    ]
 
-    m = re.search(r'href=[^>]*?(get\.php\?md5=[^\"\'> ]+)', html)
-    if not m:
-        raise ValueError("Could not find get.php link in libgen ads page")
+    last_err = None
+    for domain in domains_to_try:
+        try:
+            ads_url = f"{domain}/ads.php?md5={md5}"
+            req = urllib.request.Request(
+                ads_url, headers={"User-Agent": "Mozilla/5.0 (compatible; annadl/1.0)"}
+            )
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                html = resp.read().decode("utf-8", errors="replace")
 
-    path = m.group(1)
-    return path if path.startswith("http") else urljoin(ads_url, path)
+            m = re.search(r'href=[^>]*?(get\.php\?md5=[^\"\'> ]+)', html)
+            if not m:
+                raise ValueError("Could not find get.php link in libgen ads page")
+
+            path = m.group(1)
+            direct = path if path.startswith("http") else urljoin(ads_url, path)
+
+            # If a fallback domain succeeded, promote it
+            if domain != primary:
+                cfg = _load_cfg()
+                cfg["libgen_base_url"] = domain
+                _save_cfg(cfg)
+                _libgen_mgr.invalidate()
+                logging.info(f"[libgen] Switched primary domain → {domain}")
+
+            return direct
+        except Exception as exc:
+            logging.warning(f"[libgen] {domain} failed: {exc}")
+            if domain == primary:
+                _libgen_mgr.invalidate(domain)
+            last_err = exc
+            continue
+
+    raise last_err or ConnectionError("All libgen domains are unreachable")
 
 
 # ---------------------------------------------------------------------------
@@ -791,6 +909,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• `/mode search slash|hashtag|text|all` — search mode\n"
         "• `/connect` — register this group as delivery target\n"
         "• `/setwelcome <text>` — set welcome message\n"
+        "• `/welcomeoff` — disable welcome message\n"
+        "• `/welcomeon` — enable welcome message\n"
         "  _Reply to a photo to include an image_\n"
         "• `/service on|off` — enable or disable the bot\n"
         "• `/auto_delete on|off` — enable/disable auto-delete in PM\n"
@@ -810,6 +930,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• Delete delay: `{delete_time_str}` \\({delete_time}s\\)\n"
         f"• Dump destination: {dump_channel_str}\n"
         f"• Daily download limit: `{daily_limit_str}`\n"
+        f"• Welcome message: `{'✅ enabled' if cfg.get('welcome_enabled', True) else '❌ disabled'}`\n"
     )
     await update.message.reply_text(text, parse_mode="Markdown")
 
@@ -957,6 +1078,24 @@ async def cmd_setwelcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"✅ Welcome message updated{photo_note}:\n\n_{_esc(preview)}_",
         parse_mode="Markdown"
     )
+
+
+async def cmd_welcomeoff(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin command: /welcomeoff — disable the welcome message."""
+    if not await _is_admin(update, context):
+        await update.message.reply_text("❌ You don't have permission to use this command.")
+        return
+    _set_cfg_value("welcome_enabled", False)
+    await update.message.reply_text("🔕 Welcome message has been *disabled*.\nUse /welcomeon to re-enable.", parse_mode="Markdown")
+
+
+async def cmd_welcomeon(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin command: /welcomeon — enable the welcome message."""
+    if not await _is_admin(update, context):
+        await update.message.reply_text("❌ You don't have permission to use this command.")
+        return
+    _set_cfg_value("welcome_enabled", True)
+    await update.message.reply_text("🔔 Welcome message has been *enabled*.\nUse /welcomeoff to disable.", parse_mode="Markdown")
 
 
 async def cmd_service(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1479,7 +1618,7 @@ async def _process_md5_download(md5: str, update: Update, context: ContextTypes.
             "format": "Unknown",
             "size": "Unknown",
             "md5": md5,
-            "url": f"{BASE_URL}/md5/{md5}"
+            "url": f"{_domain_mgr.url}/md5/{md5}"
         }
 
     # ---- Daily download limit check ----
@@ -1854,6 +1993,11 @@ async def new_member_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     cfg = _load_cfg()
+
+    # Respect the welcome_enabled toggle
+    if not cfg.get("welcome_enabled", True):
+        return
+
     welcome = cfg.get("welcome", {})
     welcome_text = welcome.get("text", "")
     welcome_photo = welcome.get("photo_file_id", None)
@@ -1939,6 +2083,8 @@ def main():
     app.add_handler(CommandHandler("dump", wrap_gated(cmd_dump)))
     app.add_handler(CommandHandler("pm_search", wrap_gated(cmd_pm_search)))
     app.add_handler(CommandHandler("dailylimit", wrap_gated(cmd_dailylimit)))
+    app.add_handler(CommandHandler("welcomeoff", wrap_gated(cmd_welcomeoff)))
+    app.add_handler(CommandHandler("welcomeon", wrap_gated(cmd_welcomeon)))
 
     # Broadcast — ConversationHandler (private chat only, no gating needed — enforced inside)
     broadcast_conv = ConversationHandler(
