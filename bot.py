@@ -78,6 +78,9 @@ user_sessions: dict = {}
 # ---------------------------------------------------------------------------
 DOMAIN_SOURCE = "https://shadowlibraries.github.io/DirectDownloads/AnnasArchive/"
 FALLBACK_DOMAINS = [
+    "https://annas-archive.se",
+    "https://annas-archive.li",
+    "https://annas-archive.gs",
     "https://annas-archive.gl",
     "https://annas-archive.pk",
     "https://annas-archive.gd",
@@ -115,12 +118,16 @@ def _fetch_html_links(url: str) -> list:
 
 
 def _test_domain(domain: str) -> bool:
+    """Check if a domain is reachable, using cloudscraper to bypass Cloudflare."""
     try:
-        req = urllib.request.Request(
-            domain + "/", headers={"User-Agent": "Mozilla/5.0 (compatible; annadl/1.0)"}
+        scraper = cloudscraper.create_scraper(
+            browser={'browser': 'chrome', 'platform': 'linux', 'desktop': True}
         )
-        with urllib.request.urlopen(req, timeout=8) as resp:
-            return resp.status < 400
+        try:
+            resp = scraper.get(domain + "/", timeout=10)
+            return resp.status_code < 400
+        finally:
+            scraper.close()
     except Exception:
         return False
 
@@ -595,17 +602,33 @@ def _sync_search(query: str, count: int = 10) -> list:
         d for d in _domain_mgr.fallbacks if d != primary
     ]
 
+    # Also try to fetch live domains from shadowlibraries (appended at end)
+    try:
+        live_links = _fetch_html_links(DOMAIN_SOURCE)
+        live_domains = [
+            h.split("?")[0].rstrip("/")
+            for h in live_links
+            if "annas-archive" in h and "shadowlibraries" not in h and h.startswith("http")
+        ]
+        for ld in live_domains:
+            if ld not in domains_to_try:
+                domains_to_try.append(ld)
+    except Exception:
+        pass
+
     resp = None
     working_domain = primary
 
-    # Fresh scraper per search — avoids stale TLS fingerprints and
-    # keeps file descriptors clean (closed at the end).
-    scraper = cloudscraper.create_scraper()
+    # Fresh scraper per search with Chrome fingerprint — avoids stale TLS
+    # fingerprints and Cloudflare blocks.
+    scraper = cloudscraper.create_scraper(
+        browser={'browser': 'chrome', 'platform': 'linux', 'desktop': True}
+    )
     try:
         for domain in domains_to_try:
             try:
                 url = f"{domain}/search?index=&page=1&sort=&src=lgli&display=&q={quoted_query}"
-                resp = scraper.get(url, timeout=25)
+                resp = scraper.get(url, timeout=20)
                 if resp.status_code == 200:
                     working_domain = domain
                     break
