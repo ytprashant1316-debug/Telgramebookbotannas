@@ -619,8 +619,22 @@ def _sync_search(query: str, count: int = 10) -> list:
     resp = None
     working_domain = primary
 
-    # Fresh scraper per search with Chrome fingerprint — avoids stale TLS
-    # fingerprints and Cloudflare blocks.
+    # Cloudflare challenge markers — if any of these appear in the body,
+    # the response is a block page, not real content.
+    CF_MARKERS = [
+        "cf-browser-verification",
+        "cf_chl_opt",
+        "challenge-platform",
+        "Just a moment",
+        "Checking your browser",
+        "Attention Required",
+        "cf-turnstile",
+    ]
+
+    def _is_cloudflare_challenge(text: str) -> bool:
+        return any(marker in text for marker in CF_MARKERS)
+
+    # Fresh scraper per search with Chrome fingerprint
     scraper = cloudscraper.create_scraper(
         browser={'browser': 'chrome', 'platform': 'linux', 'desktop': True}
     )
@@ -628,21 +642,34 @@ def _sync_search(query: str, count: int = 10) -> list:
         for domain in domains_to_try:
             try:
                 url = f"{domain}/search?index=&page=1&sort=&src=lgli&display=&q={quoted_query}"
-                resp = scraper.get(url, timeout=20)
-                if resp.status_code == 200:
-                    working_domain = domain
-                    break
+                r = scraper.get(url, timeout=20)
+
+                if r.status_code != 200:
+                    logging.warning(f"[search] {domain} returned status {r.status_code}")
+                    continue
+
+                # Check for Cloudflare challenge pages
+                if _is_cloudflare_challenge(r.text):
+                    logging.warning(f"[search] {domain} returned Cloudflare challenge, skipping")
+                    if domain == primary:
+                        _domain_mgr.invalidate(domain)
+                    continue
+
+                # Looks like a real response
+                resp = r
+                working_domain = domain
+                break
+
             except Exception as exc:
                 logging.warning(f"[search] {domain} failed: {exc}")
                 if domain == primary:
                     _domain_mgr.invalidate(domain)
-                resp = None
                 continue
     finally:
         scraper.close()
 
-    if resp is None or resp.status_code != 200:
-        raise ConnectionError("All Anna's Archive domains are unreachable")
+    if resp is None:
+        raise ConnectionError("All Anna's Archive domains are unreachable or blocked by Cloudflare")
 
     # If a fallback domain succeeded, promote it as the new cached primary
     if working_domain != primary:
