@@ -42,10 +42,10 @@ from bs4 import BeautifulSoup
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-BOT_TOKEN = "8994067851:AAGVoAaaKTPhOY4EZn4gRm1tuOJ5yHU7YNo"
+BOT_TOKEN = "8560074195:AAHSNsVaRJu2194--dPh7D06AmqAWcNt_jQ"
 
 # MongoDB Connection Setup
-MONGO_URI = "mongodb+srv://soniprashant671_db_user:ritik1103@cluster0.j5hwlec.mongodb.net/?appName=Cluster0"
+MONGO_URI = "mongodb+srv://soniprashant671_db_user:sC0oFGksHNHf8kIz@cluster0.j5hwlec.mongodb.net/?appName=Cluster0"
 mongo_client = None
 settings_col = None
 users_col = None
@@ -790,7 +790,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• `/mode pm|group` — set file delivery target\n"
         "• `/mode search slash|hashtag|text|all` — search mode\n"
         "• `/connect` — register this group as delivery target\n"
-        "• `/setwelcome <text>` — set welcome message\n"
+        "• `/setwelcome <text>` — set welcome message \\(`/setwelcome off` to disable\\)\n"
         "  _Reply to a photo to include an image_\n"
         "• `/service on|off` — enable or disable the bot\n"
         "• `/auto_delete on|off` — enable/disable auto-delete in PM\n"
@@ -922,6 +922,18 @@ async def cmd_setwelcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = " ".join(context.args).strip()
     photo_file_id = None
 
+    # Handle /setwelcome off — disable welcome message
+    if text.lower() == "off":
+        cfg = _load_cfg()
+        cfg["welcome"] = {}
+        _save_cfg(cfg)
+        await update.message.reply_text(
+            "✅ Welcome message has been *disabled*\\. "
+            "New members will no longer receive a welcome message\\.",
+            parse_mode="Markdown"
+        )
+        return
+
     # Check if the command is a reply to a photo message
     replied = update.message.reply_to_message
     if replied and replied.photo:
@@ -934,7 +946,8 @@ async def cmd_setwelcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
         current_photo = "yes 🖼️" if current.get("photo_file_id") else "no"
         await update.message.reply_text(
             f"Usage: `/setwelcome Your welcome text here`\n"
-            f"To include a photo: reply to a photo with `/setwelcome Your text`\n\n"
+            f"To include a photo: reply to a photo with `/setwelcome Your text`\n"
+            f"To disable: `/setwelcome off`\n\n"
             f"Current text: _{_esc(current_text)}_\n"
             f"Has photo: {current_photo}\n\n"
             f"You can use `{{name}}` as a placeholder for the new member's name\\.",
