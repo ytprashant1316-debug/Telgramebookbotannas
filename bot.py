@@ -582,27 +582,10 @@ def _is_chat_allowed(update: Update, allow_connect: bool = False) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Reusable cloudscraper session (prevents "Too many open files")
-# ---------------------------------------------------------------------------
-_scraper_lock = threading.Lock()
-_scraper_instance = None
-
-def _get_scraper():
-    """Return a shared cloudscraper session, creating it on first use."""
-    global _scraper_instance
-    if _scraper_instance is None:
-        with _scraper_lock:
-            if _scraper_instance is None:
-                _scraper_instance = cloudscraper.create_scraper()
-    return _scraper_instance
-
-
-# ---------------------------------------------------------------------------
 # Sync worker: search
 # ---------------------------------------------------------------------------
 
 def _sync_search(query: str, count: int = 10) -> list:
-    scraper = _get_scraper()
     from urllib.parse import quote_plus
     quoted_query = quote_plus(query)
 
@@ -613,23 +596,27 @@ def _sync_search(query: str, count: int = 10) -> list:
     ]
 
     resp = None
-    working_domain = primary  # track which domain actually worked
+    working_domain = primary
 
-    for domain in domains_to_try:
-        try:
-            url = f"{domain}/search?index=&page=1&sort=&src=lgli&display=&q={quoted_query}"
-            resp = scraper.get(url, timeout=15)
-            if resp.status_code == 200:
-                working_domain = domain
-                break
-        except Exception as exc:
-            logging.warning(f"[search] {domain} failed: {exc}")
-            # If the primary domain timed-out, invalidate so next search
-            # rediscovers automatically instead of hitting the same dead host.
-            if domain == primary:
-                _domain_mgr.invalidate(domain)
-            resp = None
-            continue
+    # Fresh scraper per search — avoids stale TLS fingerprints and
+    # keeps file descriptors clean (closed at the end).
+    scraper = cloudscraper.create_scraper()
+    try:
+        for domain in domains_to_try:
+            try:
+                url = f"{domain}/search?index=&page=1&sort=&src=lgli&display=&q={quoted_query}"
+                resp = scraper.get(url, timeout=25)
+                if resp.status_code == 200:
+                    working_domain = domain
+                    break
+            except Exception as exc:
+                logging.warning(f"[search] {domain} failed: {exc}")
+                if domain == primary:
+                    _domain_mgr.invalidate(domain)
+                resp = None
+                continue
+    finally:
+        scraper.close()
 
     if resp is None or resp.status_code != 200:
         raise ConnectionError("All Anna's Archive domains are unreachable")
@@ -888,6 +875,9 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     daily_limit = _get_cfg_value("daily_dl_limit", 0)
     daily_limit_str = "♾️ unlimited" if daily_limit == 0 else f"{daily_limit} per 24h"
 
+    welcome_enabled = _get_cfg_value("welcome_enabled", True)
+    welcome_status_str = "✅ enabled" if welcome_enabled else "❌ disabled"
+
     mode_desc = {
         "all": "All modes active",
         "slash": "Only /search command",
@@ -930,7 +920,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• Delete delay: `{delete_time_str}` \\({delete_time}s\\)\n"
         f"• Dump destination: {dump_channel_str}\n"
         f"• Daily download limit: `{daily_limit_str}`\n"
-        f"• Welcome message: `{'✅ enabled' if cfg.get('welcome_enabled', True) else '❌ disabled'}`\n"
+        f"• Welcome greeting: `{welcome_status_str}`\n"
     )
     await update.message.reply_text(text, parse_mode="Markdown")
 
