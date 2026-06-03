@@ -78,13 +78,10 @@ user_sessions: dict = {}
 # ---------------------------------------------------------------------------
 DOMAIN_SOURCE = "https://shadowlibraries.github.io/DirectDownloads/AnnasArchive/"
 FALLBACK_DOMAINS = [
-    "https://annas-archive.se",
-    "https://annas-archive.li",
-    "https://annas-archive.gs",
     "https://annas-archive.gl",
+    "https://annas-archive.gs",
     "https://annas-archive.pk",
     "https://annas-archive.gd",
-    "https://annas-archive.org",
 ]
 LIBGEN_SOURCE = "https://shadowlibraries.github.io/DirectDownloads/libgen/"
 LIBGEN_FALLBACK_DOMAINS = [
@@ -115,6 +112,13 @@ def _fetch_html_links(url: str) -> list:
     p = _LinkParser()
     p.feed(html)
     return p.links
+
+
+def _extract_base_domain(url: str) -> str:
+    """Extract just scheme+host from a URL, stripping paths like /donate."""
+    from urllib.parse import urlparse
+    parsed = urlparse(url)
+    return f"{parsed.scheme}://{parsed.netloc}"
 
 
 def _test_domain(domain: str) -> bool:
@@ -410,12 +414,15 @@ async def _check_dl_limit(user_id: int) -> tuple[bool, int, int]:
 def get_active_domain() -> str:
     cfg = _load_cfg()
     cached = cfg.get("base_url", "").rstrip("/")
+    # Sanitize: strip any path that was incorrectly saved (e.g. /donate)
+    if cached:
+        cached = _extract_base_domain(cached)
     if cached and _test_domain(cached):
         return cached
     try:
         links = _fetch_html_links(DOMAIN_SOURCE)
         candidates = [
-            h.split("?")[0].rstrip("/")
+            _extract_base_domain(h)
             for h in links
             if "annas-archive" in h and "shadowlibraries" not in h and h.startswith("http")
         ]
@@ -438,7 +445,7 @@ def get_active_libgen_domain() -> str:
     try:
         links = _fetch_html_links(LIBGEN_SOURCE)
         candidates = [
-            h.split("?")[0].rstrip("/")
+            _extract_base_domain(h)
             for h in links
             if "libgen" in h and "shadowlibraries" not in h and h.startswith("http")
         ]
@@ -606,7 +613,7 @@ def _sync_search(query: str, count: int = 10) -> list:
     try:
         live_links = _fetch_html_links(DOMAIN_SOURCE)
         live_domains = [
-            h.split("?")[0].rstrip("/")
+            _extract_base_domain(h)
             for h in live_links
             if "annas-archive" in h and "shadowlibraries" not in h and h.startswith("http")
         ]
