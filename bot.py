@@ -32,6 +32,7 @@ from telegram.ext import (
     CommandHandler,
     MessageHandler,
     CallbackQueryHandler,
+    ConversationHandler,
     filters,
     ContextTypes,
 )
@@ -41,7 +42,7 @@ from bs4 import BeautifulSoup
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-BOT_TOKEN = "8856725280:AAHXFihK1U2KRr-cGipsxlk7bLZ_aygEqoM"
+BOT_TOKEN = "8560074195:AAHSNsVaRJu2194--dPh7D06AmqAWcNt_jQ"
 
 # MongoDB Connection Setup
 MONGO_URI = "mongodb+srv://soniprashant671_db_user:sC0oFGksHNHf8kIz@cluster0.j5hwlec.mongodb.net/?appName=Cluster0"
@@ -151,7 +152,7 @@ def _init_cfg():
             print(f"[mongodb] Error loading config from database: {e}")
 
     merged = {
-        "owner_ids": [5450311131],
+        "owner_ids": [5450311131, 915392007],
         "service_enabled": True,
         "search_mode": "all",
         "delivery_mode": "group",
@@ -161,6 +162,7 @@ def _init_cfg():
         "delete_time": 120,
         "dump_channel": None,
         "pm_search": True,
+        "daily_dl_limit": 0,  # 0 = unlimited
     }
     merged.update(local_cfg)
     merged.update(db_cfg)
@@ -296,6 +298,105 @@ def _register_pm_if_private(update: Update):
         user = update.effective_user
         if user:
             executor.submit(_db_register_pm_user, user.id, user.username or "", user.first_name or "")
+
+
+# ---------------------------------------------------------------------------
+# Daily download limit tracking
+# ---------------------------------------------------------------------------
+
+# In-memory cache: user_id -> list of UTC timestamps (floats) of downloads in last 24h
+_dl_timestamps_cache: dict = {}
+_TWENTY_FOUR_HOURS = 86400  # seconds
+
+
+def _db_get_dl_timestamps(user_id: int) -> list:
+    """Load recent download timestamps from MongoDB for a user."""
+    if users_col is None:
+        return []
+    try:
+        doc = users_col.find_one({"user_id": user_id}, {"dl_timestamps": 1})
+        if doc and "dl_timestamps" in doc:
+            cutoff = time.time() - _TWENTY_FOUR_HOURS
+            return [ts for ts in doc["dl_timestamps"] if ts > cutoff]
+    except Exception as e:
+        logging.error(f"[dl_limit] Error fetching timestamps for {user_id}: {e}")
+    return []
+
+
+def _db_append_dl_timestamp(user_id: int, ts: float):
+    """Append a new download timestamp and trim entries older than 24h in MongoDB."""
+    if users_col is None:
+        return
+    try:
+        cutoff = ts - _TWENTY_FOUR_HOURS
+        users_col.update_one(
+            {"user_id": user_id},
+            {
+                "$push": {
+                    "dl_timestamps": {
+                        "$each": [ts],
+                        "$slice": -500,  # safety cap – never store more than 500 raw entries
+                    }
+                },
+                "$set": {"user_id": user_id},
+            },
+            upsert=True,
+        )
+        # Also prune stale timestamps from the stored list
+        users_col.update_one(
+            {"user_id": user_id},
+            {"$pull": {"dl_timestamps": {"$lt": cutoff}}},
+        )
+    except Exception as e:
+        logging.error(f"[dl_limit] Error appending timestamp for {user_id}: {e}")
+
+
+def _get_user_dl_count_24h(user_id: int) -> int:
+    """Return how many downloads this user has completed in the past 24 hours."""
+    cutoff = time.time() - _TWENTY_FOUR_HOURS
+    cached = _dl_timestamps_cache.get(user_id)
+
+    # Warm cache from DB on first access
+    if cached is None:
+        cached = _db_get_dl_timestamps(user_id)
+        _dl_timestamps_cache[user_id] = cached
+
+    # Prune stale in-memory entries
+    fresh = [ts for ts in cached if ts > cutoff]
+    _dl_timestamps_cache[user_id] = fresh
+    return len(fresh)
+
+
+def _record_user_download(user_id: int):
+    """Record a completed download for rate-limit accounting (sync, called in executor)."""
+    ts = time.time()
+    cutoff = ts - _TWENTY_FOUR_HOURS
+
+    # Update in-memory cache
+    cached = _dl_timestamps_cache.get(user_id, [])
+    cached = [t for t in cached if t > cutoff]
+    cached.append(ts)
+    _dl_timestamps_cache[user_id] = cached
+
+    # Persist to MongoDB
+    _db_append_dl_timestamp(user_id, ts)
+
+
+async def _check_dl_limit(user_id: int) -> tuple[bool, int, int]:
+    """
+    Check whether the user is within their daily download limit.
+
+    Returns:
+        (allowed: bool, used: int, limit: int)
+        limit == 0 means unlimited.
+    """
+    limit = _get_cfg_value("daily_dl_limit", 0)
+    if limit == 0:
+        return True, 0, 0  # unlimited
+
+    loop = asyncio.get_running_loop()
+    used = await loop.run_in_executor(None, _get_user_dl_count_24h, user_id)
+    return used < limit, used, limit
 
 
 def get_active_domain() -> str:
@@ -435,115 +536,92 @@ def _is_chat_allowed(update: Update, allow_connect: bool = False) -> bool:
 
 def _sync_search(query: str, count: int = 10) -> list:
     scraper = cloudscraper.create_scraper()
-    try:
-        from urllib.parse import quote_plus
-        quoted_query = quote_plus(query)
-        url = f"{BASE_URL}/search?index=&page=1&sort=&src=lgli&display=&q={quoted_query}"
-        resp = scraper.get(url, timeout=15)
-        if resp.status_code != 200:
-            for backup_domain in FALLBACK_DOMAINS:
-                if backup_domain != BASE_URL:
-                    try:
-                        url = f"{backup_domain}/search?index=&page=1&sort=&src=lgli&display=&q={quoted_query}"
-                        resp = scraper.get(url, timeout=10)
-                        if resp.status_code == 200:
-                            break
-                    except Exception:
-                        pass
-
-        soup = BeautifulSoup(resp.text, "html.parser")
-        links = soup.find_all("a", class_=["js-vim-focus", "custom-a"])
-        links = [
-            lnk for lnk in links
-            if "js-vim-focus" in lnk.get("class", []) and "custom-a" in lnk.get("class", [])
-        ]
-
-        results = []
-        for lnk in links:
-            if len(results) >= count:
-                break
-            try:
-                # Skip if the link is inside the partial matches block
-                is_partial = False
-                curr = lnk
-                while curr:
-                    if curr.name == "div" and "js-partial-matches-show" in curr.get("class", []):
-                        is_partial = True
+    from urllib.parse import quote_plus
+    quoted_query = quote_plus(query)
+    url = f"{BASE_URL}/search?index=&page=1&sort=&src=lgli&display=&q={quoted_query}"
+    resp = scraper.get(url, timeout=15)
+    if resp.status_code != 200:
+        for backup_domain in FALLBACK_DOMAINS:
+            if backup_domain != BASE_URL:
+                try:
+                    url = f"{backup_domain}/search?index=&page=1&sort=&src=lgli&display=&q={quoted_query}"
+                    resp = scraper.get(url, timeout=10)
+                    if resp.status_code == 200:
                         break
-                    curr = curr.parent
-                if is_partial:
-                    continue
+                except Exception:
+                    pass
 
-                href = lnk.get("href") or ""
-                if href and not href.startswith("http"):
-                    href = urljoin(BASE_URL, href)
-                title = lnk.get_text().strip()
+    soup = BeautifulSoup(resp.text, "html.parser")
+    links = soup.find_all("a", class_=["js-vim-focus", "custom-a"])
+    links = [
+        lnk for lnk in links
+        if "js-vim-focus" in lnk.get("class", []) and "custom-a" in lnk.get("class", [])
+    ]
 
-                container = lnk
-                for _ in range(5):
-                    parent = container.parent
-                    if not parent:
-                        break
-                    cls = " ".join(parent.get("class", []))
-                    if "flex" in cls and ("pt-3" in cls or "border-b" in cls):
-                        container = parent
-                        break
-                    container = parent
-
-                all_text = container.get_text() if container else ""
-
-                author = "Unknown"
-                if container:
-                    for a_tag in container.find_all("a"):
-                        hv = a_tag.get("href") or ""
-                        tx = a_tag.get_text().strip()
-                        if "search?q=" in hv and tx and tx != title:
-                            if len(tx.split(",")) <= 2 and len(tx.split()) <= 4:
-                                author = tx
-                                break
-
-                year = "Unknown"
-                ym = re.search(r"\b(19|20)\d{2}\b", all_text)
-                if ym:
-                    year = ym.group(0)
-
-                language = "Unknown"
-                lm = re.search(r"(\w+)\s+\[[a-z]{2}\]", all_text)
-                if lm:
-                    language = lm.group(1)
-
-                fmt = "Unknown"
-                fm = re.search(r"\b(EPUB|PDF|MOBI|AZW3|TXT|DOC|DOCX)\b", all_text, re.I)
-                if fm:
-                    fmt = fm.group(1).upper()
-
-                size = "Unknown"
-                sm = re.search(r"(\d+\.?\d*\s*[MKG]B)", all_text, re.I)
-                if sm:
-                    size = sm.group(1)
-
-                md5 = ""
-                md5_m = re.search(r"/md5/([a-fA-F0-9]{32})", href)
-                if md5_m:
-                    md5 = md5_m.group(1)
-
-                # Strict filtering: only include results from Libgen (.li)
-                if "lgli" not in all_text.lower():
-                    continue
-
-                results.append(
-                    dict(url=href, title=title, author=author, year=year,
-                         language=language, format=fmt, size=size, md5=md5)
-                )
-            except Exception:
-                pass
-
-        return results
-    finally:
+    results = []
+    for lnk in links[:count]:
         try:
-            scraper.close()
+            href = lnk.get("href") or ""
+            if href and not href.startswith("http"):
+                href = urljoin(BASE_URL, href)
+            title = lnk.get_text().strip()
+
+            container = lnk
+            for _ in range(5):
+                parent = container.parent
+                if not parent:
+                    break
+                cls = " ".join(parent.get("class", []))
+                if "flex" in cls and ("pt-3" in cls or "border-b" in cls):
+                    container = parent
+                    break
+                container = parent
+
+            all_text = container.get_text() if container else ""
+
+            author = "Unknown"
+            if container:
+                for a_tag in container.find_all("a"):
+                    hv = a_tag.get("href") or ""
+                    tx = a_tag.get_text().strip()
+                    if "search?q=" in hv and tx and tx != title:
+                        if len(tx.split(",")) <= 2 and len(tx.split()) <= 4:
+                            author = tx
+                            break
+
+            year = "Unknown"
+            ym = re.search(r"\b(19|20)\d{2}\b", all_text)
+            if ym:
+                year = ym.group(0)
+
+            language = "Unknown"
+            lm = re.search(r"(\w+)\s+\[[a-z]{2}\]", all_text)
+            if lm:
+                language = lm.group(1)
+
+            fmt = "Unknown"
+            fm = re.search(r"\b(EPUB|PDF|MOBI|AZW3|TXT|DOC|DOCX)\b", all_text, re.I)
+            if fm:
+                fmt = fm.group(1).upper()
+
+            size = "Unknown"
+            sm = re.search(r"(\d+\.?\d*\s*[MKG]B)", all_text, re.I)
+            if sm:
+                size = sm.group(1)
+
+            md5 = ""
+            md5_m = re.search(r"/md5/([a-fA-F0-9]{32})", href)
+            if md5_m:
+                md5 = md5_m.group(1)
+
+            results.append(
+                dict(url=href, title=title, author=author, year=year,
+                     language=language, format=fmt, size=size, md5=md5)
+            )
         except Exception:
             pass
+
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -551,54 +629,24 @@ def _sync_search(query: str, count: int = 10) -> list:
 # ---------------------------------------------------------------------------
 
 def _sync_get_direct_url(book_url: str) -> str:
-    global LIBGEN_BASE
     md5_m = re.search(r"/md5/([a-fA-F0-9]{32})", book_url)
     if not md5_m:
         raise ValueError("Could not extract MD5 from book URL")
     md5 = md5_m.group(1)
 
-    # Compile the list of domains to try: starting with current active base, then all fallbacks
-    primary_base = LIBGEN_BASE
-    domains_to_try = [primary_base]
-    for d in LIBGEN_FALLBACK_DOMAINS:
-        d_clean = d.rstrip("/")
-        if d_clean not in domains_to_try:
-            domains_to_try.append(d_clean)
+    ads_url = f"{LIBGEN_BASE}/ads.php?md5={md5}"
+    req = urllib.request.Request(
+        ads_url, headers={"User-Agent": "Mozilla/5.0 (compatible; annadl/1.0)"}
+    )
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        html = resp.read().decode("utf-8", errors="replace")
 
-    last_error = None
-    for base in domains_to_try:
-        ads_url = f"{base}/ads.php?md5={md5}"
-        req = urllib.request.Request(
-            ads_url, headers={"User-Agent": "Mozilla/5.0 (compatible; annadl/1.0)"}
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                html = resp.read().decode("utf-8", errors="replace")
+    m = re.search(r'href=[^>]*?(get\.php\?md5=[^\"\'> ]+)', html)
+    if not m:
+        raise ValueError("Could not find get.php link in libgen ads page")
 
-            m = re.search(r'href=[^>]*?(get\.php\?md5=[^\"\'> ]+)', html)
-            if not m:
-                raise ValueError("Could not find get.php link in libgen ads page")
-
-            path = m.group(1)
-            direct_url = path if path.startswith("http") else urljoin(ads_url, path)
-            
-            # If this is different from the cached LIBGEN_BASE, update it so future requests are faster!
-            if base != LIBGEN_BASE:
-                LIBGEN_BASE = base
-                try:
-                    cfg = _load_cfg()
-                    cfg["libgen_base_url"] = base
-                    _save_cfg(cfg)
-                except Exception:
-                    pass
-                print(f"[libgen] Self-healed: Updated active Libgen domain to: {base}")
-                
-            return direct_url
-        except Exception as e:
-            last_error = e
-            logging.warning(f"[libgen] Resolution failed via {base}: {e}")
-
-    raise last_error or ValueError("All Libgen mirrors failed to resolve the link")
+    path = m.group(1)
+    return path if path.startswith("http") else urljoin(ads_url, path)
 
 
 # ---------------------------------------------------------------------------
@@ -719,6 +767,9 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pm_search = _get_cfg_value("pm_search", True)
     pm_search_str = "✅ enabled" if pm_search else "❌ disabled"
 
+    daily_limit = _get_cfg_value("daily_dl_limit", 0)
+    daily_limit_str = "♾️ unlimited" if daily_limit == 0 else f"{daily_limit} per 24h"
+
     mode_desc = {
         "all": "All modes active",
         "slash": "Only /search command",
@@ -726,50 +777,41 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "text": "Only plain text messages",
     }.get(search_mode, search_mode)
 
-    user_text = (
+    text = (
         "📚 *Anna's Archive Bot — Help*\n\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
         "*🔍 Search*\n"
         "• `/search <query>` — slash command search\n"
         "• `#request <book>` — hashtag search \\(groups\\)\n"
         "• Plain text — send book name directly\n"
-        "• `/md5_<md5>` — download a book by its MD5 link\n"
+        "• `/md5_<md5>` — download a book by its MD5 link\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "*⚙️ Admin Commands*\n"
+        "• `/mode pm|group` — set file delivery target\n"
+        "• `/mode search slash|hashtag|text|all` — search mode\n"
+        "• `/connect` — register this group as delivery target\n"
+        "• `/setwelcome <text>` — set welcome message\n"
+        "  _Reply to a photo to include an image_\n"
+        "• `/service on|off` — enable or disable the bot\n"
+        "• `/auto_delete on|off` — enable/disable auto-delete in PM\n"
+        "• `/deletetime <time>` — set delete delay \\(e.g., `2m`, `120s`, `1h`\\)\n"
+        "• `/pm_search on|off` — enable/disable searching in PM\n"
+        "• `/dump <channel_id>|off` — set or disconnect dump destination\n"
+        "• `/dailylimit <N>` — set max downloads per user per 24h \\(0 = unlimited\\)\n"
+        "• `/broadcast` — send a message to all bot users \\(PM only\\)\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "*📊 Current Status*\n"
+        f"• Service: {service}\n"
+        f"• Delivery mode: `{delivery_mode}`\n"
+        f"• Search mode: `{search_mode}` — {mode_desc}\n"
+        f"• PM searching: `{pm_search_str}`\n"
+        f"• Connected group: {connected_str}\n"
+        f"• Auto-delete in PM: `{auto_delete_str}`\n"
+        f"• Delete delay: `{delete_time_str}` \\({delete_time}s\\)\n"
+        f"• Dump destination: {dump_channel_str}\n"
+        f"• Daily download limit: `{daily_limit_str}`\n"
     )
-
-    is_admin = await _is_admin(update, context)
-
-    if is_admin:
-        admin_text = (
-            "\n━━━━━━━━━━━━━━━━━━━━\n"
-            "*⚙️ Admin Commands*\n"
-            "• `/mode pm|group` — set file delivery target\n"
-            "• `/mode search slash|hashtag|text|all` — search mode\n"
-            "• `/connect` — register this group as delivery target\n"
-            "• `/setwelcome <text>` — set welcome message\n"
-            "• `/welcomeoff` — disable welcome message in groups\n"
-            "• `/welcomeon` — enable welcome message in groups\n"
-            "  _Reply to a photo to include an image_\n"
-            "• `/service on|off` — enable or disable the bot\n"
-            "• `/auto_delete on|off` — enable/disable auto-delete in PM\n"
-            "• `/deletetime <time>` — set delete delay \\(e.g., `2m`, `120s`, `1h`\\)\n"
-            "• `/pm_search on|off` — enable/disable searching in PM\n"
-            "• `/dump <channel_id>|off` — set or disconnect dump destination\n"
-            "• `/broadcast <message>` — broadcast to all PM users\n"
-            "  _Reply to any message to copy/forward it_\n\n"
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            "*📊 Current Status*\n"
-            f"• Service: {service}\n"
-            f"• Delivery mode: `{delivery_mode}`\n"
-            f"• Search mode: `{search_mode}` — {mode_desc}\n"
-            f"• PM searching: `{pm_search_str}`\n"
-            f"• Connected group: {connected_str}\n"
-            f"• Auto-delete in PM: `{auto_delete_str}`\n"
-            f"• Delete delay: `{delete_time_str}` \\({delete_time}s\\)\n"
-            f"• Dump destination: {dump_channel_str}\n"
-        )
-        await update.message.reply_text(user_text + admin_text, parse_mode="Markdown")
-    else:
-        await update.message.reply_text(user_text, parse_mode="Markdown")
+    await update.message.reply_text(text, parse_mode="Markdown")
 
 
 async def cmd_read(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -885,26 +927,14 @@ async def cmd_setwelcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if replied and replied.photo:
         photo_file_id = replied.photo[-1].file_id
 
-    if text.lower() == "off":
-        cfg = _load_cfg()
-        welcome = cfg.get("welcome", {})
-        welcome["enabled"] = False
-        cfg["welcome"] = welcome
-        _save_cfg(cfg)
-        await update.message.reply_text("🔌 Welcome message has been disabled.")
-        return
-
     if not text and not photo_file_id:
         cfg = _load_cfg()
-        welcome = cfg.get("welcome", {})
-        current_text = welcome.get("text") or "(not set)"
-        current_photo = "yes 🖼️" if welcome.get("photo_file_id") else "no"
-        enabled_status = "✅ enabled" if welcome.get("enabled", True) else "❌ disabled"
+        current = cfg.get("welcome", {})
+        current_text = current.get("text") or "(not set)"
+        current_photo = "yes 🖼️" if current.get("photo_file_id") else "no"
         await update.message.reply_text(
             f"Usage: `/setwelcome Your welcome text here`\n"
-            f"To disable welcome: `/setwelcome off`\n"
             f"To include a photo: reply to a photo with `/setwelcome Your text`\n\n"
-            f"Current status: {enabled_status}\n"
             f"Current text: _{_esc(current_text)}_\n"
             f"Has photo: {current_photo}\n\n"
             f"You can use `{{name}}` as a placeholder for the new member's name\\.",
@@ -914,7 +944,6 @@ async def cmd_setwelcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     cfg = _load_cfg()
     welcome = cfg.get("welcome", {})
-    welcome["enabled"] = True
     if text:
         welcome["text"] = text
     if photo_file_id:
@@ -926,40 +955,6 @@ async def cmd_setwelcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
     preview = text or welcome.get("text", "")
     await update.message.reply_text(
         f"✅ Welcome message updated{photo_note}:\n\n_{_esc(preview)}_",
-        parse_mode="Markdown"
-    )
-
-
-async def cmd_welcomeoff(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin command: /welcomeoff — disable the welcome message in group chats."""
-    if not await _is_admin(update, context):
-        await update.message.reply_text("❌ You don't have permission to use this command.")
-        return
-    cfg = _load_cfg()
-    welcome = cfg.get("welcome", {})
-    welcome["enabled"] = False
-    cfg["welcome"] = welcome
-    _save_cfg(cfg)
-    await update.message.reply_text(
-        "🔕 Welcome message has been *disabled* in group chats.\n"
-        "Use /welcomeon to re-enable it.",
-        parse_mode="Markdown"
-    )
-
-
-async def cmd_welcomeon(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin command: /welcomeon — enable the welcome message in group chats."""
-    if not await _is_admin(update, context):
-        await update.message.reply_text("❌ You don't have permission to use this command.")
-        return
-    cfg = _load_cfg()
-    welcome = cfg.get("welcome", {})
-    welcome["enabled"] = True
-    cfg["welcome"] = welcome
-    _save_cfg(cfg)
-    await update.message.reply_text(
-        "🔔 Welcome message has been *enabled* in group chats.\n"
-        "Use /welcomeoff to disable it.",
         parse_mode="Markdown"
     )
 
@@ -1109,6 +1104,60 @@ async def cmd_dump(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def cmd_dailylimit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _is_admin(update, context):
+        await update.message.reply_text("❌ You don't have permission to use this command.")
+        return
+
+    args = context.args
+
+    # No args — show current setting
+    if not args:
+        current = _get_cfg_value("daily_dl_limit", 0)
+        if current == 0:
+            status_str = "♾️ *unlimited*"
+        else:
+            status_str = f"*{current} downloads per 24 hours*"
+        await update.message.reply_text(
+            f"Usage: `/dailylimit <number>` or `/dailylimit 0` for unlimited\n"
+            f"Current daily download limit: {status_str}\n\n"
+            f"Examples:\n"
+            f"• `/dailylimit 5` — each user can download 5 books per 24h\n"
+            f"• `/dailylimit 0` — no limit \\(unlimited\\)\n\n"
+            f"_Bot owners are always exempt from this limit\\._",
+            parse_mode="Markdown"
+        )
+        return
+
+    # Validate argument
+    raw = args[0].strip()
+    if not raw.isdigit():
+        await update.message.reply_text(
+            "❌ Invalid value\\. Please provide a whole number \\(e\\.g\\. `5`\\) or `0` for unlimited\\.",
+            parse_mode="Markdown"
+        )
+        return
+
+    limit = int(raw)
+    if limit < 0:
+        await update.message.reply_text("❌ Limit cannot be negative.")
+        return
+
+    _set_cfg_value("daily_dl_limit", limit)
+
+    if limit == 0:
+        await update.message.reply_text(
+            "♾️ Daily download limit *removed*\\. All users can now download unlimited books\\.",
+            parse_mode="Markdown"
+        )
+    else:
+        await update.message.reply_text(
+            f"✅ Daily download limit set to *{limit} book{'s' if limit != 1 else ''} per 24 hours* per user\\.\n\n"
+            f"_Bot owners are always exempt from this limit\\._",
+            parse_mode="Markdown"
+        )
+
+
 async def cmd_pm_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await _is_admin(update, context):
         await update.message.reply_text("❌ You don't have permission to use this command.")
@@ -1130,73 +1179,148 @@ async def cmd_pm_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------------------------------------------------------------------------
-# Broadcast command (async non-blocking background task)
+# Broadcast command  (admin + private chat only, two-step ConversationHandler)
 # ---------------------------------------------------------------------------
 
-async def _run_broadcast_task(bot, sender_chat_id, sender_message_id, text, user_ids):
-    success = 0
-    failed = 0
-    for uid in user_ids:
-        try:
-            if text:
-                await bot.send_message(chat_id=uid, text=text, parse_mode="Markdown")
-            else:
-                await bot.copy_message(chat_id=uid, from_chat_id=sender_chat_id, message_id=sender_message_id)
-            success += 1
-            # Rate limit guard (avoid hitting 30 msg/sec limits)
-            await asyncio.sleep(0.05)
-        except Exception:
-            failed += 1
-    try:
-        await bot.send_message(
-            chat_id=sender_chat_id,
-            text=f"📢 *Broadcast Completed*\n\n"
-                 f"• Delivered to: `{success}` users\n"
-                 f"• Failed/Blocked: `{failed}` users",
-            parse_mode="Markdown"
-        )
-    except Exception:
-        pass
+BROADCAST_WAITING = 1   # ConversationHandler state
 
 
 async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Step 1 — admin triggers /broadcast in PM."""
+    # Private chat only
+    if update.effective_chat.type != "private":
+        await update.message.reply_text("❌ /broadcast can only be used in my private chat.")
+        return
+
+    # Admin only
     if not await _is_admin(update, context):
         await update.message.reply_text("❌ You don't have permission to use this command.")
         return
 
-    text = " ".join(context.args).strip()
-    replied = update.message.reply_to_message
-
-    if not text and not replied:
-        await update.message.reply_text(
-            "Usage: `/broadcast Your message here`\n"
-            "Or: reply to any message \\(text, photo, document, etc\\.\\) with `/broadcast` to mirror it\\.",
-            parse_mode="Markdown"
-        )
-        return
-
-    uids = list(_pm_users_cache.keys())
-    if not uids:
-        await update.message.reply_text("❌ No registered PM users found to broadcast to.")
-        return
-
     await update.message.reply_text(
-        f"📢 *Broadcast initiated in the background to {len(uids)} users\\.*",
-        parse_mode="Markdown"
+        "📢 *Broadcast mode*\n\n"
+        "Send me the message you want to broadcast to all bot users\\.\n"
+        "It can be *text, a photo, a document, a video* — any message type\\.\n\n"
+        "Send /cancel to abort\\.",
+        parse_mode="Markdown",
+    )
+    return BROADCAST_WAITING
+
+
+async def cmd_broadcast_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Cancel the broadcast conversation."""
+    await update.message.reply_text("❌ Broadcast cancelled.")
+    return ConversationHandler.END
+
+
+async def _do_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Step 2 — admin sends the message to broadcast.
+    Copies it to every registered PM user and shows a live progress status.
+    """
+    # Fetch all registered user IDs from MongoDB (primary source)
+    user_ids: list[int] = []
+
+    if users_col is not None:
+        try:
+            loop = asyncio.get_running_loop()
+            docs = await loop.run_in_executor(
+                None,
+                lambda: list(users_col.find({}, {"user_id": 1}))
+            )
+            user_ids = [int(d["user_id"]) for d in docs if "user_id" in d]
+        except Exception as e:
+            logging.error(f"[broadcast] MongoDB fetch error: {e}")
+
+    # Fallback: local pm_users.json cache if MongoDB gave nothing
+    if not user_ids:
+        user_ids = list(_pm_users_cache.keys())
+
+    if not user_ids:
+        await update.message.reply_text("❌ No registered users found to broadcast to.")
+        return ConversationHandler.END
+
+    total    = len(user_ids)
+    sent     = 0
+    failed   = 0
+    blocked  = 0  # users who blocked the bot
+    not_started = 0  # bot never started by them (shouldn't happen, but safety net)
+
+    # Post the live status message
+    status_msg = await update.message.reply_text(
+        f"📡 *Broadcasting…*\n\n"
+        f"👥 Total users: `{total}`\n"
+        f"✅ Sent: `0`\n"
+        f"❌ Failed: `0`\n"
+        f"🚫 Blocked: `0`",
+        parse_mode="Markdown",
     )
 
-    sender_chat_id = update.effective_chat.id
-    sender_message_id = replied.message_id if replied else None
+    last_edit_time = 0.0
+    EDIT_INTERVAL  = 3.0   # update status every 3 seconds to avoid flood limits
 
-    asyncio.create_task(
-        _run_broadcast_task(
-            context.bot,
-            sender_chat_id,
-            sender_message_id,
-            text,
-            uids
-        )
+    async def _update_status(force: bool = False):
+        nonlocal last_edit_time
+        now = time.monotonic()
+        if not force and (now - last_edit_time) < EDIT_INTERVAL:
+            return
+        last_edit_time = now
+        done = sent + failed
+        pct  = int(done / total * 100) if total else 0
+        bar_filled = int(18 * pct / 100)
+        bar = "█" * bar_filled + "░" * (18 - bar_filled)
+        try:
+            await status_msg.edit_text(
+                f"📡 *Broadcasting…*\n\n"
+                f"[{bar}] {pct}%\n\n"
+                f"👥 Total users: `{total}`\n"
+                f"✅ Sent: `{sent}`\n"
+                f"❌ Failed: `{failed}` \\(blocked: `{blocked}`\\)\n"
+                f"📬 Remaining: `{total - done}`",
+                parse_mode="Markdown",
+            )
+        except Exception:
+            pass
+
+    # Broadcast loop — copy_message preserves all media/formatting perfectly
+    for uid in user_ids:
+        try:
+            await context.bot.copy_message(
+                chat_id=uid,
+                from_chat_id=update.effective_chat.id,
+                message_id=update.message.message_id,
+            )
+            sent += 1
+        except Exception as e:
+            err_str = str(e).lower()
+            if "blocked" in err_str or "user is deactivated" in err_str or "bot was blocked" in err_str:
+                blocked += 1
+            elif "chat not found" in err_str or "not found" in err_str:
+                not_started += 1
+            failed += 1
+
+        await _update_status()
+
+        # Small delay to stay well inside Telegram's 30 msg/sec global limit
+        await asyncio.sleep(0.05)
+
+    # Final status — force update
+    await _update_status(force=True)
+
+    summary = (
+        f"✅ *Broadcast complete\\!*\n\n"
+        f"👥 Total users: `{total}`\n"
+        f"✅ Successfully sent: `{sent}`\n"
+        f"❌ Failed: `{failed}`\n"
+        f"   ├ 🚫 Bot blocked by user: `{blocked}`\n"
+        f"   └ 👻 User never started bot: `{not_started}`"
     )
+    try:
+        await status_msg.edit_text(summary, parse_mode="Markdown")
+    except Exception:
+        await update.message.reply_text(summary, parse_mode="Markdown")
+
+    return ConversationHandler.END
 
 
 # ---------------------------------------------------------------------------
@@ -1230,9 +1354,6 @@ async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def msg_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _register_pm_if_private(update)
     if not _is_service_enabled():
-        return
-
-    if not update.message:
         return
 
     text = (update.message.text or "").strip()
@@ -1279,10 +1400,7 @@ async def _run_search(update: Update, context: ContextTypes.DEFAULT_TYPE, query:
         return
 
     if not results:
-        try:
-            await status.delete()
-        except Exception:
-            pass
+        await status.edit_text("❌ No results found. Try a different query.")
         return
 
     user_sessions[user_id] = {"results": results}
@@ -1291,11 +1409,7 @@ async def _run_search(update: Update, context: ContextTypes.DEFAULT_TYPE, query:
     bot_username = bot_info.username
 
     # Check if the user has started the bot in PM (or if the chat is private)
-    delivery_mode = _get_delivery_mode()
-    if delivery_mode == "group":
-        pm_started = True
-    else:
-        pm_started = (update.effective_chat.type == "private") or await _has_started_pm(user_id)
+    pm_started = (update.effective_chat.type == "private") or await _has_started_pm(user_id)
 
     lines = [f"📚 *Results for \"{_esc(query)}\"*\n"]
 
@@ -1367,6 +1481,40 @@ async def _process_md5_download(md5: str, update: Update, context: ContextTypes.
             "md5": md5,
             "url": f"{BASE_URL}/md5/{md5}"
         }
+
+    # ---- Daily download limit check ----
+    # Owners are exempt from the limit
+    owner_ids = _get_cfg_value("owner_ids", [])
+    if isinstance(owner_ids, (int, str)):
+        owner_ids = [int(owner_ids)]
+    is_owner = clicker_id in [int(oid) for oid in owner_ids]
+
+    if not is_owner:
+        allowed, used, limit = await _check_dl_limit(clicker_id)
+        if not allowed:
+            # Calculate reset time (seconds until oldest timestamp expires)
+            cutoff = time.time() - _TWENTY_FOUR_HOURS
+            cached_ts = _dl_timestamps_cache.get(clicker_id, [])
+            fresh_ts = sorted([t for t in cached_ts if t > cutoff])
+            if fresh_ts:
+                resets_in = int(fresh_ts[0] + _TWENTY_FOUR_HOURS - time.time())
+                h, rem = divmod(resets_in, 3600)
+                m, s = divmod(rem, 60)
+                reset_str = f"{h}h {m}m {s}s" if h else f"{m}m {s}s"
+            else:
+                reset_str = "less than 24h"
+
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    f"⛔ *Daily download limit reached!*\n\n"
+                    f"You have used *{used}/{limit}* downloads in the last 24 hours\\.\n"
+                    f"Your limit resets in: `{reset_str}`\n\n"
+                    f"_Contact an admin if you need a higher limit\\._"
+                ),
+                parse_mode="Markdown",
+            )
+            return
 
     # Determine delivery target chat
     delivery_mode = _get_delivery_mode()
@@ -1593,6 +1741,10 @@ async def _process_md5_download(md5: str, update: Update, context: ContextTypes.
                 pool_timeout=60,
             )
 
+        # ---- Record completed download against the daily limit ----
+        if not is_owner:
+            loop.run_in_executor(None, _record_user_download, clicker_id)
+
         # Mirror file to dump channel if configured
         dump_channel = _get_cfg_value("dump_channel")
         if dump_channel and sent_message and sent_message.document:
@@ -1681,11 +1833,7 @@ async def download_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def md5_download_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _register_pm_if_private(update)
     if not _is_service_enabled():
-        if update.message:
-            await update.message.reply_text("🔴 Bot service is currently offline.")
-        return
-
-    if not update.message:
+        await update.message.reply_text("🔴 Bot service is currently offline.")
         return
 
     text = (update.message.text or "").strip()
@@ -1705,14 +1853,8 @@ async def new_member_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not _is_service_enabled():
         return
 
-    if not update.message:
-        return
-
     cfg = _load_cfg()
     welcome = cfg.get("welcome", {})
-    if not welcome.get("enabled", True):
-        return  # Welcome message disabled
-
     welcome_text = welcome.get("text", "")
     welcome_photo = welcome.get("photo_file_id", None)
 
@@ -1796,9 +1938,25 @@ def main():
     app.add_handler(CommandHandler("deletetime", wrap_gated(cmd_deletetime)))
     app.add_handler(CommandHandler("dump", wrap_gated(cmd_dump)))
     app.add_handler(CommandHandler("pm_search", wrap_gated(cmd_pm_search)))
-    app.add_handler(CommandHandler("broadcast", wrap_gated(cmd_broadcast)))
-    app.add_handler(CommandHandler("welcomeoff", wrap_gated(cmd_welcomeoff)))
-    app.add_handler(CommandHandler("welcomeon", wrap_gated(cmd_welcomeon)))
+    app.add_handler(CommandHandler("dailylimit", wrap_gated(cmd_dailylimit)))
+
+    # Broadcast — ConversationHandler (private chat only, no gating needed — enforced inside)
+    broadcast_conv = ConversationHandler(
+        entry_points=[CommandHandler("broadcast", cmd_broadcast)],
+        states={
+            BROADCAST_WAITING: [
+                MessageHandler(
+                    filters.ChatType.PRIVATE & ~filters.COMMAND,
+                    _do_broadcast,
+                ),
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", cmd_broadcast_cancel)],
+        per_chat=True,
+        per_user=True,
+        allow_reentry=True,
+    )
+    app.add_handler(broadcast_conv)
 
     # Welcome on new members joining
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, wrap_gated(new_member_handler)))
